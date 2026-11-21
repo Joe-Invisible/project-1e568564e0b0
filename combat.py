@@ -49,7 +49,6 @@ class Combat:
     def __init__(self, arena, config):
         self.arena = arena
         self.mech = {**config["mech"], "size_per_cube": config["cubes"]["size_per_cube"]}
-        self.lightning_range = config["weapons"]["lightning"]["range"]
 
     def visible_shot(self, me, target):
         pos = me["pos"]
@@ -57,24 +56,6 @@ class Combat:
         origin = (*pos[:2], pos[2] + me["stats"]["muzzle_height"])
         end = (*target["pos"][:2], target["pos"][2] + height)
         return self.arena.clear_shot(origin, end)
-
-    def counterplay(self, me, target, shots):
-        if "lightning" not in target.get("weapons", ()):
-            return shots
-        distance = dist(me["pos"][:2], target["pos"][:2])
-        close = 0
-        if distance > 0:
-            close = sum((a - b) * v for a, b, v in
-                        zip(me["pos"][:2], target["pos"][:2], target["vel"][:2])) / distance
-        safe = []
-        for shot in shots:
-            weapon = me["weapons"][shot.slot]
-            if weapon["kind"] == "laser" and not weapon.get("charge", 0):
-                buffer = 6 + max(0, close) * (weapon["stats"]["charge"] + 0.2)
-                if distance <= self.lightning_range + buffer:
-                    continue
-            safe.append(shot)
-        return safe
 
     def solutions(self, me, target):
         height, radius = target_center(target, self.mech)

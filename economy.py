@@ -113,31 +113,6 @@ class Economy:
                 return
         self.objective = (ident, now, distance, hp, capture)
 
-    def passing_shot(self, obs, combat, move):
-        """Farm an objective along the current route while the main gun is free."""
-        me = obs["self"]
-        if me["hp"] < me["max_hp"] * 0.55 or not any(move):
-            return []
-        pos = me["pos"]
-        candidates = []
-        for crate in obs["crates"]:
-            distance = dist(pos, crate["pos"])
-            if 12 <= distance <= 85 and crate["hp"] > 0:
-                candidates.append((distance + 0.04 * crate["hp"], {**crate, "kind": "crate"}))
-        if me["hp"] >= me["max_hp"] * 0.72:
-            for drone in obs["mechs"]:
-                distance = dist(pos, drone["pos"])
-                if drone["kind"] == "npc" and 48 <= distance <= 90:
-                    candidates.append((distance + 0.04 * drone.get("hp", 350), drone))
-        candidates.sort(key=lambda item: item[0])
-        for _, item in candidates[:3]:
-            shots = combat.solutions(me, item)
-            # Charging a laser slows our rotation. These are incidental shots.
-            gun = [shot for shot in shots if me["weapons"][shot.slot]["kind"] == "gun"]
-            if gun:
-                return gun
-        return []
-
     def approach(self, me, item, combat):
         pos, point, stats = me["pos"], item["pos"], me["stats"]
         kind = item["kind"]

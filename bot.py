@@ -7,7 +7,7 @@ from time import perf_counter
 
 import mechfight as mf
 from arena import Arena
-from combat import Combat, angle_delta, bearing
+from combat import Combat, bearing
 from economy import Economy, WEAPON_VALUE
 from policy import Features, Mode, Recovery, RecoveryProfile, choose
 
@@ -16,8 +16,7 @@ UPGRADE_RANK = {key: rank for rank, key in enumerate((
     "armor", "nanites", "gun_damage", "plating", "gun_rate", "servos",
     "laser_charge", "laser_damage", "reactor", "capacitor", "gun_velocity",
 ))}
-VARIANTS = ("baseline", "reset", "bounded", "loot-first", "economy", "combat", "moving-farm")
-ECONOMY_VARIANTS = ("economy", "combat", "moving-farm")
+VARIANTS = ("baseline", "reset", "bounded", "loot-first", "economy")
 
 
 def direction(start, end):
@@ -41,9 +40,6 @@ class Bot:
         if variant in ("bounded", "loot-first"):
             profile = RecoveryProfile(**(profile or {}))
         self.loot_first = variant == "loot-first"
-        self.combat_matchups = variant == "combat"
-        self.moving_farm = variant == "moving-farm"
-        self.last_target = None
         self.recovery = Recovery(profile) if variant in ("reset", "bounded", "loot-first") else None
         self.simulation = simulation
         if variant != "baseline":
@@ -52,7 +48,7 @@ class Bot:
         self.config = hello["config"]
         self.arena = Arena(hello["map"]["dir"], self.config["mech"])
         self.combat = Combat(self.arena, self.config)
-        self.economy = Economy(self.arena, self.config) if variant in ECONOMY_VARIANTS else None
+        self.economy = Economy(self.arena, self.config) if variant == "economy" else None
         self.tracks = {}
         self.last_damage = None
         self.route = []
@@ -142,10 +138,7 @@ class Bot:
             self.economy.record_progress(obs, loot if mode is Mode.LOOT else None)
         action = {"tick": obs["tick"]}
         if mode is Mode.ENGAGE:
-            if self.combat_matchups:
-                goal = self.matchup_move(me, target, zone, now)
-            else:
-                goal = self.combat_move(pos, target["pos"], preferred_range, now)
+            goal = self.combat_move(pos, target["pos"], preferred_range, now)
         elif mode is Mode.DISENGAGE:
             goal = self.cover_goal(obs, threat, attackers if recovering else ())
         elif mode is Mode.PURSUE and chase is not None:
@@ -164,8 +157,6 @@ class Bot:
         dodge = self.dodge(me, obs["projectiles"], move)
         if dodge is not None and not urgent:
             move = dodge
-        dodge_laser = (self.combat_matchups and mode is Mode.ENGAGE and target.get("charging", False)
-                       and abs(angle_delta(target["aim"][0], bearing(target["pos"], pos))) < 0.21)
         action.update(move=move, jump=jump)
         moving = move != [0, 0]
         if jump:
@@ -176,17 +167,14 @@ class Bot:
             action["boost"] = me["energy"] > 12
         elif me["grounded"]:
             action["boost"] = bool(moving and not conserve
-                                   and (urgent or mode is Mode.DISENGAGE or dodge is not None or dodge_laser)
-                                   and me["energy"] > (35 if dodge_laser else 20))
+                                   and (urgent or mode is Mode.DISENGAGE or dodge is not None)
+                                   and me["energy"] > 20)
 
         if mode is Mode.LOOT and loot is not None and "hp" in loot:
             if not self.economy or not shots or (not under_fire and features.target_distance > 90):
                 farm_shots = self.combat.solutions(me, loot)
                 if farm_shots or not self.economy:
                     shots = farm_shots
-        if (self.moving_farm and not shots and mode is not Mode.DISENGAGE
-                and not urgent and not under_fire and features.target_distance > 65):
-            shots = self.economy.passing_shot(obs, self.combat, move)
         firing = shots and mode is not Mode.DISENGAGE and not recovering
         if firing:
             self.combat.triggers(me, shots, action)
@@ -226,53 +214,14 @@ class Bot:
 
     def target(self, me, enemies):
         pos = me["pos"]
-        def cost(enemy):
-            distance = dist(pos, enemy["pos"])
-            if self.combat_matchups:
-                hp = enemy.get("hp", enemy.get("max_hp", 1400))
-                return distance + hp * 0.052 - 24 * (enemy["id"] == self.last_target)
-            return distance + 45 * enemy.get("hp", 1) / enemy.get("max_hp", 1)
-
-        ranked = sorted(enemies, key=cost)
+        ranked = sorted(enemies, key=lambda m: (
+            dist(pos, m["pos"]) + 45 * m.get("hp", 1) / m.get("max_hp", 1)
+        ))
         for target in ranked[:4]:
             shots = self.combat.solutions(me, target)
-            if self.combat_matchups:
-                shots = self.combat.counterplay(me, target, shots)
             if shots:
-                self.last_target = target["id"]
                 return target, shots
         return (ranked[0] if ranked else None), []
-
-    def matchup_move(self, me, target, zone, now):
-        pos, foe = me["pos"], target["pos"]
-        kinds = {w["kind"] for w in me["weapons"] if w is not None}
-        theirs = target.get("weapons", ())
-        lightning_range = self.config["weapons"]["lightning"]["range"]
-        if "lightning" in kinds and me["energy"] >= 25 and ("lightning" not in theirs or "laser" in theirs):
-            low, high = 24, lightning_range - 4
-        elif "laser" in kinds:
-            low, high = (88, 123) if "lightning" in theirs else (72, 105)
-        elif "lightning" in theirs:
-            low, high = lightning_range + 15, lightning_range + 36
-        elif "laser" in theirs:
-            low, high = 34, 59
-        else:
-            low, high = 52, 78
-        yaw = bearing(pos, foe)
-        distance = dist(pos[:2], foe[:2])
-        radial = 0
-        if distance > high:
-            radial = min(1, (distance - high) / 18)
-        elif distance < low:
-            radial = max(-1, (distance - low) / 16)
-        lateral = 8 if int(now / 1.4) % 2 else -8
-        dx = radial * 11 * cos(yaw) - lateral * sin(yaw)
-        dy = radial * 11 * sin(yaw) + lateral * cos(yaw)
-        goal = (pos[0] + dx, pos[1] + dy)
-        if not inside(goal, zone["center"], zone["radius"], 5):
-            inward = direction(pos, zone["center"])
-            return (goal[0] + inward[0] * 10, goal[1] + inward[1] * 10)
-        return goal
 
     def preferred_range(self, me):
         kinds = {weapon["kind"] for weapon in me["weapons"] if weapon is not None}
