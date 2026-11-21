@@ -46,6 +46,7 @@ class Arena:
         self.slope = tan(radians(mech["max_slope_deg"]))
         self.step_up = mech["step_up"]
         self.walkable = lru_cache(maxsize=48_000)(self.walkable)
+        self.walk_edge = lru_cache(maxsize=64_000)(self.walk_edge)
 
     def ground(self, x, y):
         grid = self.grid
@@ -125,12 +126,11 @@ class Arena:
                     return node
         return None
 
-    @lru_cache(maxsize=64_000)
     def walk_edge(self, current, neighbor, radius, height):
         point = self.point(current)
         return self.walk_line((*point, self.ground(*point)), self.point(neighbor), radius, height)
 
-    def route(self, position, goal, radius, height, deadline):
+    def route(self, position, goal, radius, height, deadline, max_expansions=None):
         start = self.nearest_node(position, radius, height, connect=True)
         end = self.nearest_node(goal, radius, height)
         if start is None or end is None:
@@ -140,10 +140,14 @@ class Arena:
         costs = {start: 0}
         parents = {start: None}
         closest = start
+        expansions = 0
         while queue and perf_counter() < deadline:
+            if max_expansions is not None and expansions >= max_expansions:
+                break
             _, cost, current = heappop(queue)
             if cost != costs[current]:
                 continue
+            expansions += 1
             if dist(current, end) < dist(closest, end):
                 closest = current
             if current == end:

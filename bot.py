@@ -1,5 +1,6 @@
 """Placement-focused mechfight/1 bot."""
 
+import json
 from math import cos, dist, inf, pi, sin, sqrt
 from os import environ
 from time import perf_counter
@@ -7,7 +8,7 @@ from time import perf_counter
 import mechfight as mf
 from arena import Arena
 from combat import Combat, bearing
-from policy import Features, Mode, Recovery, choose
+from policy import Features, Mode, Recovery, RecoveryProfile, choose
 
 
 UPGRADE_RANK = {key: rank for rank, key in enumerate((
@@ -29,12 +30,19 @@ class Bot:
     name = "oval-tactics"
     policy = staticmethod(choose)
 
-    def __init__(self, hello, variant="baseline"):
-        if variant not in ("baseline", "reset"):
+    def __init__(self, hello, variant="baseline", *, simulation=False, profile=None):
+        if variant not in ("baseline", "reset", "bounded", "loot-first"):
             raise ValueError(f"unknown bot policy: {variant}")
-        self.recovery = Recovery() if variant == "reset" else None
+        if profile is not None and variant not in ("bounded", "loot-first"):
+            raise ValueError("Recovery settings require the bounded or loot-first policy")
+        if variant in ("bounded", "loot-first"):
+            profile = RecoveryProfile(**(profile or {}))
+        self.loot_first = variant == "loot-first"
+        self.recovery = None if variant == "baseline" else Recovery(profile)
+        self.simulation = simulation
         if self.recovery is not None:
-            self.name = "oval-tactics-reset"
+            self.name = f"oval-tactics-{variant}"
+        self.ammo_fraction = profile.ammo_fraction if profile is not None else 0.25
         self.config = hello["config"]
         self.arena = Arena(hello["map"]["dir"], self.config["mech"])
         self.combat = Combat(self.arena, self.config)
@@ -49,7 +57,7 @@ class Bot:
         self.scan = (hello["seed"] % 360) * pi / 180
 
     def act(self, obs):
-        deadline = perf_counter() + 0.027
+        deadline = inf if self.simulation else perf_counter() + 0.027
         me, now, zone = obs["self"], obs["t"], obs["zone"]
         pos, stats = me["pos"], me["stats"]
         enemies = sorted((m for m in obs["mechs"] if m["kind"] == "mech"),
@@ -96,7 +104,7 @@ class Bot:
             secondary_ready = any(me["weapons"][shot.slot]["kind"] != "gun"
                                   and me["weapons"][shot.slot]["cooldown"] <= 0.15 for shot in shots)
             reload_needed = gun is not None and (gun.get("reload", 0) > 0
-                                                 or gun["ammo"] <= gun["stats"]["mag"] * 0.25)
+                                                 or gun["ammo"] <= gun["stats"]["mag"] * self.ammo_fraction)
             was_recovering = self.recovery.started is not None
             self.recovery.update(now, features, len(attackers), reload_needed and not secondary_ready,
                                  stats["regen_delay"])
@@ -108,6 +116,9 @@ class Bot:
                 mode = Mode.DISENGAGE
             if recovering and attackers:
                 threat = attackers[0]["pos"]
+        if (self.loot_first and loot is not None and not urgent and not recovering
+                and not under_fire and features.target_distance > 85):
+            mode = Mode.LOOT
         action = {"tick": obs["tick"]}
         if mode is Mode.ENGAGE:
             goal = self.combat_move(pos, target["pos"], preferred_range, now)
@@ -184,26 +195,27 @@ class Bot:
                 return target, shots
         return (ranked[0] if ranked else None), []
 
-    @staticmethod
-    def preferred_range(me):
+    def preferred_range(self, me):
         kinds = {weapon["kind"] for weapon in me["weapons"] if weapon is not None}
         if "lightning" in kinds:
             return 33
         if "mortar" in kinds or "laser" in kinds:
             return 85
-        return 65
+        return 100 if self.loot_first else 65
 
     def loot_goal(self, obs):
         me, zone = obs["self"], obs["zone"]
         pos = me["pos"]
         candidates = []
         if None in me["weapons"]:
-            candidates.extend((dist(pos, p["pos"]) - 18, p) for p in obs["pickups"]
+            candidates.extend((dist(pos, p["pos"]) - (34 if self.loot_first else 18), p)
+                              for p in obs["pickups"]
                               if p["kind"] != "gun" and dist(pos, p["pos"]) < 75)
         candidates.extend((dist(pos, p["pos"]) - 25, p) for p in obs["cubes"]
                           if dist(pos, p["pos"]) < 55)
-        candidates.extend((dist(pos, p["pos"]) + 18, p) for p in obs["crates"]
-                          if dist(pos, p["pos"]) < 45 and p["hp"] > 0
+        candidates.extend((dist(pos, p["pos"]) + (6 if self.loot_first else 18), p)
+                          for p in obs["crates"]
+                          if dist(pos, p["pos"]) < (70 if self.loot_first else 45) and p["hp"] > 0
                           and self.combat.visible_shot(me, p))
         for drop in obs["drops"]:
             if drop["holder"] in (None, me["id"]) and drop["lands_in"] < 4:
@@ -307,7 +319,9 @@ class Bot:
             return direct, False
 
         if not roof and not self.route and now >= self.next_route_time and perf_counter() < deadline:
-            self.route = self.arena.route(pos, goal, radius, height, deadline)
+            self.route = self.arena.route(
+                pos, goal, radius, height, deadline, max_expansions=180 if self.simulation else None
+            )
             self.route_goal = tuple(goal[:2])
             self.next_route_time = now + 0.3
             while self.route and dist(pos[:2], self.route[0]) < 2.6:
@@ -373,7 +387,13 @@ class Bot:
 
 
 if __name__ == "__main__":
-    variant = environ.get("MECHFIGHT_POLICY", "baseline")
-    if variant not in ("baseline", "reset"):
+    selection = json.loads(environ["MECHFIGHT_PROFILE"]) if environ.get("MECHFIGHT_PROFILE") else {}
+    variant = selection.get("variant", environ.get("MECHFIGHT_POLICY", "baseline"))
+    profile = selection.get("profile")
+    if variant not in ("baseline", "reset", "bounded", "loot-first"):
         raise SystemExit(f"Unknown MECHFIGHT_POLICY: {variant}")
-    mf.run(lambda hello: Bot(hello, variant))
+    if profile is not None:
+        RecoveryProfile(**profile)
+        if variant not in ("bounded", "loot-first"):
+            raise SystemExit("Recovery settings require the bounded or loot-first policy")
+    mf.run(lambda hello: Bot(hello, variant, profile=profile))

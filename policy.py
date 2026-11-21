@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
+from math import isfinite
 
 
 class Mode(Enum):
@@ -26,6 +27,23 @@ class Features:
     can_pursue: bool
 
 
+@dataclass(frozen=True)
+class RecoveryProfile:
+    exposed_s: float = 2.5
+    max_s: float = 7.0
+    retry_s: float = 10.0
+    ammo_fraction: float = 0.25
+    pressure_health: float = 0.65
+
+    def __post_init__(self):
+        times = (self.exposed_s, self.max_s, self.retry_s)
+        fractions = (self.ammo_fraction, self.pressure_health)
+        if not (all(isfinite(t) and t > 0 for t in times)
+                and self.exposed_s <= self.max_s
+                and all(isfinite(f) and 0 <= f <= 1 for f in fractions)):
+            raise ValueError("Invalid recovery profile")
+
+
 def choose(state: Features) -> Mode:
     if state.zone_urgent:
         return Mode.ROTATE
@@ -48,22 +66,34 @@ def choose(state: Features) -> Mode:
 class Recovery:
     """Stay out of combat long enough to reload and begin recovering HP."""
 
-    def __init__(self):
+    def __init__(self, profile=None):
+        self.profile = profile
         self.started = None
         self.last_exchange = float("-inf")
         self.retry_after = 0
 
     def update(self, now, state, clear_threats, reload_needed, regen_delay):
+        profile = self.profile
         if self.started is not None:
+            elapsed = now - self.started
             quiet = now - max(self.started, self.last_exchange)
             recovered = quiet >= regen_delay and state.health >= 0.78 and not reload_needed
-            if recovered or now - self.started >= 14:
+            if profile is None:
+                done = recovered or elapsed >= 14
+            else:
+                exposed = clear_threats > 0 or state.under_fire
+                reloaded = not reload_needed and state.health >= 0.78 and elapsed >= 0.5
+                done = (recovered or reloaded or elapsed >= profile.max_s
+                        or (exposed and elapsed >= profile.exposed_s))
+            if done:
                 self.started = None
-                self.retry_after = now + 4
+                self.retry_after = now + (4 if profile is None else profile.retry_s)
             return
 
         finishing = state.can_shoot and state.target_health < 0.12 and state.health > 0.3
-        pressed = clear_threats >= 2 or (clear_threats > 0 and state.health < 0.50)
+        pressure_health = 1.0 if profile is None else profile.pressure_health
+        pressed = ((clear_threats >= 2 and state.health <= pressure_health)
+                   or (clear_threats > 0 and state.health < min(0.50, pressure_health)))
         if (now >= self.retry_after and not state.zone_urgent
                 and ((pressed and not finishing) or reload_needed and state.can_shoot)):
             self.started = now
