@@ -8,6 +8,7 @@ from time import perf_counter
 import mechfight as mf
 from arena import Arena
 from combat import Combat, bearing
+from economy import Economy, WEAPON_VALUE
 from policy import Features, Mode, Recovery, RecoveryProfile, choose
 
 
@@ -15,6 +16,7 @@ UPGRADE_RANK = {key: rank for rank, key in enumerate((
     "armor", "nanites", "gun_damage", "plating", "gun_rate", "servos",
     "laser_charge", "laser_damage", "reactor", "capacitor", "gun_velocity",
 ))}
+VARIANTS = ("baseline", "reset", "bounded", "loot-first", "economy")
 
 
 def direction(start, end):
@@ -31,21 +33,22 @@ class Bot:
     policy = staticmethod(choose)
 
     def __init__(self, hello, variant="baseline", *, simulation=False, profile=None):
-        if variant not in ("baseline", "reset", "bounded", "loot-first"):
+        if variant not in VARIANTS:
             raise ValueError(f"unknown bot policy: {variant}")
         if profile is not None and variant not in ("bounded", "loot-first"):
             raise ValueError("Recovery settings require the bounded or loot-first policy")
         if variant in ("bounded", "loot-first"):
             profile = RecoveryProfile(**(profile or {}))
         self.loot_first = variant == "loot-first"
-        self.recovery = None if variant == "baseline" else Recovery(profile)
+        self.recovery = Recovery(profile) if variant in ("reset", "bounded", "loot-first") else None
         self.simulation = simulation
-        if self.recovery is not None:
+        if variant != "baseline":
             self.name = f"oval-tactics-{variant}"
         self.ammo_fraction = profile.ammo_fraction if profile is not None else 0.25
         self.config = hello["config"]
         self.arena = Arena(hello["map"]["dir"], self.config["mech"])
         self.combat = Combat(self.arena, self.config)
+        self.economy = Economy(self.arena, self.config) if variant == "economy" else None
         self.tracks = {}
         self.last_damage = None
         self.route = []
@@ -69,9 +72,11 @@ class Bot:
             zone["shrink_end"] - now < max(0, edge_distance) / stats["walk_speed"] * 1.8 + 12
         )
         urgent = not me["in_zone"] or unsafe_soon
+        if self.economy:
+            urgent = self.economy.urgent(obs, urgent)
         pressure = sum(dist(m["pos"], pos) < 72 for m in enemies)
         under_fire = self.last_damage is not None and now - self.last_damage[0] < 2.5
-        loot = self.loot_goal(obs)
+        loot = self.economy.choose(obs, self.combat) if self.economy else self.loot_goal(obs)
         target, shots = self.target(me, enemies)
 
         remembered = None
@@ -119,6 +124,18 @@ class Bot:
         if (self.loot_first and loot is not None and not urgent and not recovering
                 and not under_fire and features.target_distance > 85):
             mode = Mode.LOOT
+        if self.economy and loot is not None and not urgent and mode is not Mode.DISENGAGE:
+            distance_to_loot = dist(pos, loot["pos"])
+            farming = now < 75 and me["cubes"] < 6 and features.health > 0.55
+            opening = farming and not under_fire and features.target_distance > 65
+            close_cube = (loot["kind"] == "cube" and distance_to_loot < (20 if under_fire else 34)
+                          and features.health > 0.55)
+            capture = (loot["kind"] == "drop" and loot["holder"] == me["id"]
+                       and loot["capture_s"] - loot["progress"] < 1.1 and not under_fire)
+            if opening or close_cube or capture:
+                mode = Mode.LOOT
+        if self.economy:
+            self.economy.record_progress(obs, loot if mode is Mode.LOOT else None)
         action = {"tick": obs["tick"]}
         if mode is Mode.ENGAGE:
             goal = self.combat_move(pos, target["pos"], preferred_range, now)
@@ -127,11 +144,16 @@ class Bot:
         elif mode is Mode.PURSUE and chase is not None:
             goal = chase
         elif mode is Mode.LOOT and loot is not None:
-            goal = loot["pos"]
+            goal = self.economy.approach(me, loot, self.combat) if self.economy else loot["pos"]
         else:
             goal = self.zone_goal(pos, zone)
+            if self.economy and urgent:
+                goal = self.economy.rotate(obs, goal)
 
         move, jump = self.move_to(me, goal, now, deadline, urgent)
+        conserve = self.economy and self.economy.conserve_rotation_energy(obs, goal, urgent)
+        if conserve and me["grounded"] and me["energy"] >= 36 and now >= self.jet_until:
+            jump = True
         dodge = self.dodge(me, obs["projectiles"], move)
         if dodge is not None and not urgent:
             move = dodge
@@ -144,10 +166,15 @@ class Bot:
         if now < self.jet_until:
             action["boost"] = me["energy"] > 12
         elif me["grounded"]:
-            action["boost"] = moving and (urgent or mode is Mode.DISENGAGE or dodge is not None) and me["energy"] > 20
+            action["boost"] = bool(moving and not conserve
+                                   and (urgent or mode is Mode.DISENGAGE or dodge is not None)
+                                   and me["energy"] > 20)
 
         if mode is Mode.LOOT and loot is not None and "hp" in loot:
-            shots = self.combat.solutions(me, loot)
+            if not self.economy or not shots or (not under_fire and features.target_distance > 90):
+                farm_shots = self.combat.solutions(me, loot)
+                if farm_shots or not self.economy:
+                    shots = farm_shots
         firing = shots and mode is not Mode.DISENGAGE and not recovering
         if firing:
             self.combat.triggers(me, shots, action)
@@ -170,7 +197,8 @@ class Bot:
                 self.recovery.last_exchange = now
             if event["type"] == "kill":
                 self.tracks.pop(event["target"], None)
-            elif event["type"] == "damaged" and event.get("bearing") is not None:
+            elif (event["type"] == "damaged" and event.get("bearing") is not None
+                  and (not self.economy or event.get("weapon") != "npc")):
                 self.last_damage = (now, event["bearing"])
         self.tracks = {key: track for key, track in self.tracks.items() if now - track[0] < 7}
 
@@ -238,6 +266,17 @@ class Bot:
         if offer:
             action["pick"] = min(range(len(offer["choices"])),
                                  key=lambda i: UPGRADE_RANK.get(offer["choices"][i]["id"], len(UPGRADE_RANK)))
+        if self.economy:
+            swaps = [(WEAPON_VALUE[p["kind"]], p["id"], self.economy.wants(me["weapons"], p["kind"]))
+                     for p in obs["pickups"] if
+                     dist(p["pos"][:2], me["pos"][:2]) <= self.config["loot"]["pickup_radius"]
+                     and abs(p["pos"][2] - me["pos"][2]) <= 4]
+            best = max((swap for swap in swaps if swap[2] is not None), default=None)
+            if best is not None:
+                _, action["take"], slot = best
+                if slot >= 0:
+                    action["drop"] = slot
+            return
         if None in me["weapons"]:
             choices = [p for p in obs["pickups"] if p["kind"] != "gun"
                        and dist(p["pos"][:2], me["pos"][:2]) <= self.config["loot"]["pickup_radius"]
@@ -390,7 +429,7 @@ if __name__ == "__main__":
     selection = json.loads(environ["MECHFIGHT_PROFILE"]) if environ.get("MECHFIGHT_PROFILE") else {}
     variant = selection.get("variant", environ.get("MECHFIGHT_POLICY", "baseline"))
     profile = selection.get("profile")
-    if variant not in ("baseline", "reset", "bounded", "loot-first"):
+    if variant not in VARIANTS:
         raise SystemExit(f"Unknown MECHFIGHT_POLICY: {variant}")
     if profile is not None:
         RecoveryProfile(**profile)

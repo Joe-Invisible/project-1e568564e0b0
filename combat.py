@@ -40,6 +40,8 @@ def target_center(target, mech):
         return mech["height"] * scale * 0.55, mech["radius"] * scale
     if target.get("kind") == "npc":
         return 1.75, 1.8
+    if target.get("kind") == "crate":
+        return 1.2, 1.4
     return 1.0, 1.0
 
 
