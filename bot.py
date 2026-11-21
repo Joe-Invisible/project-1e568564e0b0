@@ -16,7 +16,7 @@ UPGRADE_RANK = {key: rank for rank, key in enumerate((
     "armor", "nanites", "gun_damage", "plating", "gun_rate", "servos",
     "laser_charge", "laser_damage", "reactor", "capacitor", "gun_velocity",
 ))}
-VARIANTS = ("baseline", "reset", "bounded", "loot-first", "economy")
+VARIANTS = ("baseline", "reset", "bounded", "loot-first", "economy", "crate-laser")
 
 
 def direction(start, end):
@@ -40,6 +40,7 @@ class Bot:
         if variant in ("bounded", "loot-first"):
             profile = RecoveryProfile(**(profile or {}))
         self.loot_first = variant == "loot-first"
+        self.crate_laser = variant == "crate-laser"
         self.recovery = Recovery(profile) if variant in ("reset", "bounded", "loot-first") else None
         self.simulation = simulation
         if variant != "baseline":
@@ -48,7 +49,7 @@ class Bot:
         self.config = hello["config"]
         self.arena = Arena(hello["map"]["dir"], self.config["mech"])
         self.combat = Combat(self.arena, self.config)
-        self.economy = Economy(self.arena, self.config) if variant == "economy" else None
+        self.economy = Economy(self.arena, self.config) if variant in ("economy", "crate-laser") else None
         self.tracks = {}
         self.last_damage = None
         self.route = []
@@ -173,6 +174,9 @@ class Bot:
         if mode is Mode.LOOT and loot is not None and "hp" in loot:
             if not self.economy or not shots or (not under_fire and features.target_distance > 90):
                 farm_shots = self.combat.solutions(me, loot)
+                if (self.crate_laser and loot["kind"] == "crate" and not under_fire
+                        and features.target_distance > 90):
+                    farm_shots = self.combat.crate_shots(me, loot, farm_shots)
                 if farm_shots or not self.economy:
                     shots = farm_shots
         firing = shots and mode is not Mode.DISENGAGE and not recovering

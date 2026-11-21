@@ -1,7 +1,7 @@
 """Aim solutions and trigger control for the mech's two weapon slots."""
 
 from dataclasses import dataclass
-from math import asin, atan2, cos, dist, hypot, pi, radians, sin, sqrt
+from math import asin, atan2, ceil, cos, dist, hypot, inf, pi, radians, sin, sqrt
 
 
 @dataclass
@@ -49,6 +49,7 @@ class Combat:
     def __init__(self, arena, config):
         self.arena = arena
         self.mech = {**config["mech"], "size_per_cube": config["cubes"]["size_per_cube"]}
+        self.cubes = config["cubes"]
 
     def visible_shot(self, me, target):
         pos = me["pos"]
@@ -56,6 +57,31 @@ class Combat:
         origin = (*pos[:2], pos[2] + me["stats"]["muzzle_height"])
         end = (*target["pos"][:2], target["pos"][2] + height)
         return self.arena.clear_shot(origin, end)
+
+    def crate_shots(self, me, crate, shots):
+        """Use a charged beam on a quiet crate when it is faster than the gun."""
+        damage_scale = 1 + self.cubes["damage_per_cube"] * min(me["cubes"], self.cubes["stat_cap"])
+        gun = laser = None
+        beam_time = gun_time = inf
+        for shot in shots:
+            weapon = me["weapons"][shot.slot]
+            stats = weapon["stats"]
+            if weapon["kind"] == "laser" and stats["damage"] * damage_scale >= crate["hp"]:
+                charge = weapon.get("charge", 0)
+                beam_time = weapon["cooldown"] + max(0, stats["charge"] - charge) + 0.1
+                laser = shot
+            elif weapon["kind"] == "gun":
+                gun = shot
+                rounds = ceil(crate["hp"] / (stats["damage"] * damage_scale))
+                gun_time = max(weapon["cooldown"], weapon.get("reload", 0))
+                gun_time += (rounds - 1) * stats["cooldown"]
+                if not weapon.get("reload", 0) and rounds > weapon.get("ammo", 0):
+                    gun_time += stats["reload"]
+        if laser is not None and beam_time + 0.15 < gun_time:
+            return [laser]
+        if gun is not None:
+            return [shot for shot in shots if me["weapons"][shot.slot]["kind"] != "laser"]
+        return shots
 
     def solutions(self, me, target):
         height, radius = target_center(target, self.mech)
